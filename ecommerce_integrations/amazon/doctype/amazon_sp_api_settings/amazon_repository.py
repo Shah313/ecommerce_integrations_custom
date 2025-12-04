@@ -640,8 +640,10 @@ class AmazonRepository:
             return 0.0
 
         frappe.log_error(
-            f"FINANCE DEBUG for {order_id}: {payload}",
-            "Amazon Settlement Debug",
+            title=f"Amazon Finance Debug: {order_id}",
+            message=f"Amazon Settlement Debug\n\nPayload:\n{payload}"
+            
+            
         )
 
         if not payload:
