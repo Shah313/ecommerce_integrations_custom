@@ -891,6 +891,18 @@ class AmazonRepository:
                 "Amazon DN Update Error"
             )
 
+
+    def process_refunds_and_returns(self, order_id):
+        """
+        Placeholder for Amazon refunds/returns handling.
+        Currently not implemented.
+        """
+        frappe.log_error(
+            f"Refund/Return check skipped for Amazon Order {order_id}",
+            "Amazon Refund Placeholder"
+        )
+
+
     
 
     
