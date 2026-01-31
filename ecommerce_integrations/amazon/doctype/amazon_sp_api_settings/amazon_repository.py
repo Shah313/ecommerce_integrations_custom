@@ -342,7 +342,7 @@ class AmazonRepository:
 
         existing = frappe.db.get_value(
             "Sales Order",
-            {"amazon_order_id": order_id},
+            {"custom_amazon_order_id": order_id},
             "name",
         )
         if existing:
@@ -388,10 +388,18 @@ class AmazonRepository:
 
         # ---------------- SALES ORDER HEADER ----------------
         so = frappe.new_doc("Sales Order")
-        so.amazon_order_id = order_id
+        so.custom_amazon_order_id = order_id
         so.marketplace_id = order.get("MarketplaceId")
         so.customer = customer
         so.company = self.amz_setting.company
+                # Get company currency
+        company_currency = frappe.db.get_value("Company", so.company, "default_currency")
+        so.currency = company_currency  # Explicitly set
+
+        # Also set conversion rate if needed
+        so.conversion_rate = 1.0
+        so.plc_conversion_rate = 1.0
+
 
         purchase_date = order.get("PurchaseDate")
         latest_ship_date = order.get("LatestShipDate")
@@ -518,8 +526,9 @@ class AmazonRepository:
             dn = frappe.new_doc("Delivery Note")
             dn.company = so.company
             dn.customer = so.customer
+            dn.currency = so.currency
             dn.custom_against_sales_order = so.name
-            dn.custom_amazon_order_id = so.amazon_order_id
+            dn.custom_amazon_order_id = so.custom_amazon_order_id
 
             for it in so.items:
                 dn.append(
@@ -570,8 +579,10 @@ class AmazonRepository:
             si = frappe.new_doc("Sales Invoice")
             si.company = so.company
             si.customer = so.customer
+            si.currency = so.currency  # Inherit from Sales Order
+            si.conversion_rate = so.conversion_rate
             si.custom_against_sales_order = so.name
-            si.custom_amazon_order_id = so.amazon_order_id
+            si.custom_amazon_order_id = so.custom_amazon_order_id
             si.due_date = frappe.utils.add_days(frappe.utils.today(), 7)
 
             for it in so.items:
@@ -617,159 +628,350 @@ class AmazonRepository:
     # SETTLEMENT CHECK (NET PAYOUT) — PRODUCTION
     # -------------------------------------------------------------------------
 
-    def check_amazon_settlement_available(self, order_id: str) -> float:
+    def check_amazon_settlement_available(self, order_id: str):
         """
-        Returns actual NET PAYOUT received from Amazon (ItemPrice + Shipping - Fees)
-        based on Finances → list_financial_events_by_order_id.
+        FULL Amazon US Settlement Logic
+        --------------------------------
+        1. Fetch ALL settlement groups (biweekly payout groups)
+        2. For each group, fetch ALL financial events
+        3. Filter all events belonging to the specific order_id
+        4. Sum:
+           + Item Charges
+           - Item Fees
+           - Promotions
+           + Adjustments
+           - Service Fees
+           + Chargeback Adjustments
+        5. Return (net_payout_usd, settlement_id)
+        """
 
-        If payout is NOT available yet → returns 0
-        → Payment Entry will NOT be created for this order yet.
-        """
         finances = self.get_finances_instance()
 
+        # ------------------------------
+        # Step 1 — Fetch ALL settlement groups
+        # ------------------------------
         try:
-            payload = self.call_sp_api_method(
-                finances.list_financial_events_by_order_id,
-                order_id=order_id,
+            groups_payload = self.call_sp_api_method(
+                finances.list_financial_event_groups,
+                max_results=100
             )
         except Exception as e:
-            frappe.log_error(
-                f"Finances call failed for {order_id}: {str(e)}",
-                "Amazon Settlement Debug",
+            frappe.log_error(f"Cannot load settlement groups: {e}", "Amazon Settlement Error")
+            return 0.0, None
+
+        if not groups_payload:
+            return 0.0, None
+
+        groups = groups_payload.get("FinancialEventGroupList", [])
+        next_group_token = groups_payload.get("NextToken")
+
+        # Pagination: load more groups
+        while next_group_token:
+            token_payload = self.call_sp_api_method(
+                finances.list_financial_event_groups,
+                next_token=next_group_token
             )
-            return 0.0
+            groups.extend(token_payload.get("FinancialEventGroupList", []))
+            next_group_token = token_payload.get("NextToken")
 
-        frappe.log_error(
-            title=f"Amazon Finance Debug: {order_id}",
-            message=f"Amazon Settlement Debug\n\nPayload:\n{payload}"
-            
-            
-        )
+        # ------------------------------
+        # Step 2 — Search each group for this ORDER
+        # ------------------------------
 
-        if not payload:
-            return 0.0
+        for group in groups:
+            group_id = group.get("FinancialEventGroupId")
+            settlement_id = group.get("FinancialEventGroupId")  # unique payout cycle ID
 
-        events = payload.get("FinancialEvents", {}).get("ShipmentEventList", [])
-        if not events:
-            return 0.0
+            # Fetch all events inside this group
+            try:
+                events_payload = self.call_sp_api_method(
+                    finances.list_financial_events_by_group_id,
+                    group_id=group_id,
+                    max_results=100
+                )
+            except Exception as e:
+                frappe.log_error(f"Group fetch failed: {e}", "Amazon Settlement Error")
+                continue
 
-        total_payout = 0.0
+            if not events_payload:
+                continue
 
-        for event in events:
-            for item in event.get("ShipmentItemList", []):
-                # ITEM PRICE (Principal)
-                item_price = 0.0
-                shipping = 0.0
-                fees = 0.0
+            total = 0.0
+            found = False
 
-                for c in item.get("ItemChargeList", []):
-                    charge_type = c.get("ChargeType")
-                    amount = float(
-                        c.get("ChargeAmount", {}).get("CurrencyAmount", 0) or 0
-                    )
-                    if charge_type == "Principal":
-                        item_price += amount
-                    elif charge_type == "Shipping":
-                        shipping += amount
+            # Loop through ALL event types
+            while True:
+                fevents = events_payload.get("FinancialEvents", {})
 
-                for f in item.get("ItemFeeList", []):
-                    fees += float(
-                        f.get("FeeAmount", {}).get("CurrencyAmount", 0) or 0
-                    )
+                # 1️⃣ SHIPMENT EVENTS
+                for evt in fevents.get("ShipmentEventList", []):
+                    if evt.get("AmazonOrderId") == order_id:
+                        found = True
+                        for item in evt.get("ShipmentItemList", []):
+                            for c in item.get("ItemChargeList", []):
+                                total += float(c["ChargeAmount"]["CurrencyAmount"])
+                            for f in item.get("ItemFeeList", []):
+                                total -= float(f["FeeAmount"]["CurrencyAmount"])
+                            for p in item.get("PromotionList", []):
+                                total -= float(p["PromotionAmount"]["CurrencyAmount"])
 
-                total_payout += (item_price + shipping - fees)
+                # 2️⃣ REFUND EVENTS
+                for evt in fevents.get("RefundEventList", []):
+                    if evt.get("AmazonOrderId") == order_id:
+                        found = True
+                        for item in evt.get("RefundItemList", []):
+                            for c in item.get("ItemChargeAdjustmentList", []):
+                                total += float(c["ChargeAmount"]["CurrencyAmount"])
+                            for f in item.get("ItemFeeAdjustmentList", []):
+                                total -= float(f["FeeAmount"]["CurrencyAmount"])
 
-        return total_payout if total_payout > 0 else 0.0
+                # 3️⃣ ADJUSTMENT EVENTS
+                for evt in fevents.get("AdjustmentEventList", []):
+                    for adj in evt.get("AdjustmentItemList", []):
+                        if adj.get("AmazonOrderId") == order_id:
+                            found = True
+                            total += float(adj.get("QuantityAdjustment", 0))
+
+                # 4️⃣ SERVICE FEE EVENTS
+                for evt in fevents.get("ServiceFeeEventList", []):
+                    if evt.get("AmazonOrderId") == order_id:
+                        found = True
+                        for f in evt.get("FeeList", []):
+                            total -= float(f["FeeAmount"]["CurrencyAmount"])
+
+                # 5️⃣ CHARGEBACK EVENTS
+                for evt in fevents.get("ChargebackEventList", []):
+                    if evt.get("AmazonOrderId") == order_id:
+                        found = True
+                        for adj in evt.get("ChargebackAdjustmentList", []):
+                            total += float(adj["ChargeAmount"]["CurrencyAmount"])
+
+                # Pagination inside group
+                next_token = events_payload.get("NextToken")
+                if not next_token:
+                    break
+
+                events_payload = self.call_sp_api_method(
+                    finances.list_financial_events_by_group_id,
+                    group_id=group_id,
+                    next_token=next_token
+                )
+
+            if found and total > 0:
+                return total, settlement_id
+
+        # No settlement found
+        return 0.0, None
+
 
     # -------------------------------------------------------------------------
     # PAYMENT ENTRY FROM REAL AMAZON PAYOUT
     # -------------------------------------------------------------------------
 
-    def create_payment_entry_from_si(self, sales_invoice_name: str, settlement_amount: float) -> str | None:
-        try:
-            existing = frappe.db.get_value(
-                "Payment Entry",
-                {"reference_no": sales_invoice_name, "docstatus": ["<", 2]},
-                "name",
-            )
-            if existing:
-                return existing
+    def create_payment_entry_from_si(self, si_name, payout_usd, settlement_id):
+        si = frappe.get_doc("Sales Invoice", si_name)
 
-            si = frappe.get_doc("Sales Invoice", sales_invoice_name)
-
-            pe = frappe.new_doc("Payment Entry")
-            pe.payment_type = "Receive"
-            pe.company = si.company
-            pe.party_type = "Customer"
-            pe.party = si.customer
-
-            pe.paid_amount = settlement_amount
-            pe.received_amount = settlement_amount
-
-            pe.reference_no = sales_invoice_name
-            pe.reference_date = frappe.utils.today()
-            pe.custom_amazon_order_id = si.custom_amazon_order_id
-
-            payout_acct = getattr(self.amz_setting, "amazon_payout_account", None)
-            if not payout_acct:
-                frappe.throw("Please set Amazon Payout Account in Amazon SP API Settings.")
-
-            pe.paid_to = payout_acct
-
-            pe.append(
-                "references",
-                {
-                    "reference_doctype": "Sales Invoice",
-                    "reference_name": sales_invoice_name,
-                    "allocated_amount": settlement_amount,
-                },
-            )
-
-            pe.insert(ignore_permissions=True)
-            pe.submit()
-
-            frappe.log_error(
-                f"Payment Entry {pe.name} created with settlement: {settlement_amount}",
-                "Amazon PE Created",
-            )
-
-            return pe.name
-
-        except Exception as e:
-            frappe.log_error(
-                f"Payment Entry Error for SI {sales_invoice_name}: {str(e)}",
-                "Amazon PE Error",
-            )
+        # Prevent duplicate PE for same settlement
+        if si.get("custom_amazon_settlement_id") == settlement_id:
             return None
 
-    # -------------------------------------------------------------------------
-    # PROCESS ORDER STATUS → DN + SI + PAYMENT ENTRY
-    # -------------------------------------------------------------------------
+        company_currency = frappe.db.get_value("Company", si.company, "default_currency")
+        amazon_currency = si.currency
 
-    def process_order_documents_based_on_status(self, amazon_order: dict, sales_order_name: str):
-        status = amazon_order.get("OrderStatus", "")
+        # Determine exchange rate
+        if amazon_currency == company_currency:
+            exchange_rate = 1
+        else:
+            exchange_rate = frappe.utils.get_exchange_rate(amazon_currency, company_currency)
 
-        # DELIVERY NOTE on shipped / partially shipped
-        if status in ["Shipped", "PartiallyShipped"]:
-            self.create_delivery_note_from_so(sales_order_name)
+        received_amount = payout_usd * exchange_rate
 
-        # SALES INVOICE + PAYMENT ENTRY
-        if status in ["Shipped", "InvoiceUnconfirmed"]:
-            si_name = self.create_sales_invoice_from_so(sales_order_name)
-            if not si_name:
-                return
+        pe = frappe.new_doc("Payment Entry")
+        pe.payment_type = "Receive"
+        pe.company = si.company
+        pe.party_type = "Customer"
+        pe.party = si.customer
 
-            settlement = self.check_amazon_settlement_available(
-                amazon_order.get("AmazonOrderId")
+        # Multi-currency fields
+        pe.paid_amount = payout_usd
+        pe.paid_from_account_currency = amazon_currency
+        pe.received_amount = received_amount
+        pe.received_to_account_currency = company_currency
+        pe.source_exchange_rate = exchange_rate
+
+        pe.reference_no = si.name
+        pe.reference_date = frappe.utils.today()
+        pe.custom_amazon_settlement_id = settlement_id
+
+        payout_acct = self.amz_setting.amazon_payout_account
+        if not payout_acct:
+            frappe.throw("Set Amazon Payout Account in Amazon SP API Settings")
+
+        pe.paid_to = payout_acct
+
+        pe.append(
+            "references",
+            {
+                "reference_doctype": "Sales Invoice",
+                "reference_name": si.name,
+                "allocated_amount": received_amount,
+            },
+        )
+
+        pe.insert(ignore_permissions=True)
+        pe.submit()
+
+        # Save settlement ID inside invoice
+        si.custom_amazon_settlement_id = settlement_id
+        si.save(ignore_permissions=True)
+
+        return pe.name
+    
+    def update_sales_invoice(self, si_name: str, amazon_order: dict):
+        """
+        Update existing Sales Invoice.
+        """
+        try:
+            si = frappe.get_doc("Sales Invoice", si_name)
+            order_id = amazon_order.get("AmazonOrderId")
+            
+            # Update due date if needed
+            new_due_date = frappe.utils.add_days(frappe.utils.today(), 7)
+            if si.due_date != new_due_date:
+                si.due_date = new_due_date
+            
+            # Update taxes/charges if enabled
+            if self.amz_setting.taxes_charges:
+                charges_and_fees = self.get_charges_and_fees(order_id)
+                self.update_invoice_taxes(si, charges_and_fees)
+            
+            si.save(ignore_permissions=True)
+            
+            # Only submit if not already submitted
+            if si.docstatus == 0:
+                si.submit()
+            
+            frappe.db.commit()
+            
+        except Exception as e:
+            frappe.log_error(
+                f"Failed to update Sales Invoice {si_name}: {str(e)}",
+                "Amazon Invoice Update Error"
             )
 
-            if settlement > 0:
-                self.create_payment_entry_from_si(si_name, settlement)
+    def update_delivery_note(self, dn_name: str, amazon_order: dict):
+        """
+        Update existing Delivery Note.
+        """
+        try:
+            dn = frappe.get_doc("Delivery Note", dn_name)
+            order_id = amazon_order.get("AmazonOrderId")
+            status = amazon_order.get("OrderStatus")
+            
+            # Update status tracking
+            dn.custom_amazon_order_status = status
+            
+            # For partial shipments, update quantities
+            if status == "PartiallyShipped":
+                # Get updated order items
+                updated_items = self.get_order_items(order_id)
+                self.update_delivery_items(dn, updated_items)
+            
+            dn.save(ignore_permissions=True)
+            
+            # Only submit if not already submitted
+            if dn.docstatus == 0:
+                dn.submit()
+            
+            frappe.db.commit()
+            
+        except Exception as e:
+            frappe.log_error(
+                f"Failed to update Delivery Note {dn_name}: {str(e)}",
+                "Amazon DN Update Error"
+            )
+
+    
+
+    
+
+    def process_order_documents_based_on_status(self, amazon_order, so_name):
+        """
+        Create/update documents based on current Amazon status.
+        """
+        order_id = amazon_order.get("AmazonOrderId")
+        status = amazon_order.get("OrderStatus")
+        
+        so = frappe.get_doc("Sales Order", so_name)
+        
+        # Handle cancellations
+        if status == "Canceled":
+            self.handle_order_cancellation(order_id, so_name)
+            return
+        
+        # Handle returns/refunds
+        self.process_refunds_and_returns(order_id)
+        
+        # Delivery Note Logic
+        if status in ["Shipped", "PartiallyShipped"]:
+            # Check if DN already exists
+            existing_dn = frappe.db.get_value(
+                "Delivery Note",
+                {"custom_against_sales_order": so_name, "docstatus": ["<", 2]},
+                "name"
+            )
+            
+            if existing_dn:
+                # Update existing DN
+                self.update_delivery_note(existing_dn, amazon_order)
             else:
-                frappe.log_error(
-                    f"Settlement NOT available for Order {amazon_order.get('AmazonOrderId')} — skipping Payment Entry",
-                    "Amazon Settlement",
-                )
+                # Create new DN
+                self.create_delivery_note_from_so(so_name)
+        
+        # Sales Invoice Logic
+        if status in ["Shipped", "InvoiceUnconfirmed", "PartiallyShipped"]:
+            # Check if SI already exists
+            existing_si = frappe.db.get_value(
+                "Sales Invoice",
+                {"custom_against_sales_order": so_name, "docstatus": ["<", 2]},
+                "name"
+            )
+            
+            if existing_si:
+                # Update existing SI
+                self.update_sales_invoice(existing_si, amazon_order)
+            else:
+                # Create new SI
+                si_name = self.create_sales_invoice_from_so(so_name)
+                
+                # Check for settlement
+                if si_name:
+                    payout, settlement_id = self.check_amazon_settlement_available(order_id)
+                    
+                    if payout > 0 and settlement_id:
+                        # Check if payment entry already exists
+                        existing_pe = frappe.db.get_value(
+                            "Payment Entry",
+                            {
+                                "custom_amazon_settlement_id": settlement_id,
+                                "docstatus": ["<", 2]
+                            },
+                            "name"
+                        )
+                        
+                        if not existing_pe:
+                            self.create_payment_entry_from_si(si_name, payout, settlement_id)
+                    else:
+                        frappe.log_error(
+                            f"Settlement NOT available for Order {order_id}",
+                            "Amazon Settlement Check"
+     
+                        )
+    
+            
+
+
+        
 
     # -------------------------------------------------------------------------
     # MAIN GET ORDERS LOOP
@@ -777,8 +979,7 @@ class AmazonRepository:
 
     def get_orders(self, created_after: str) -> list:
         """
-        Fetch orders from Amazon → create SOs → auto-create DN, SI, Payment Entry
-        when appropriate based on status & settlement.
+        Enhanced: Fetch orders from Amazon → create/update SOs → auto-create/update DN, SI, Payment Entry
         """
         orders_api = self.get_orders_instance()
 
@@ -805,16 +1006,32 @@ class AmazonRepository:
         if not payload:
             return []
 
-        created_so_list: list[str] = []
+        processed_orders: list[str] = []
 
         while True:
             orders_list = payload.get("Orders") or []
             next_token = payload.get("NextToken")
 
             for order in orders_list:
-                so_name = self.create_sales_order(order)
+                # Check if order already exists
+                existing_so = frappe.db.get_value(
+                    "Sales Order",
+                    {"custom_amazon_order_id": order.get("AmazonOrderId")},
+                    "name"
+                )
+                
+                if existing_so:
+                    # UPDATE EXISTING SALES ORDER
+                    self.update_sales_order(existing_so, order)
+                    so_name = existing_so
+                else:
+                    # CREATE NEW SALES ORDER
+                    so_name = self.create_sales_order(order)
+                
                 if so_name:
-                    created_so_list.append(so_name)
+                    # PROCESS DOCUMENTS BASED ON CURRENT STATUS
+                    self.process_order_documents_based_on_status(order, so_name)
+                    processed_orders.append(so_name)
 
             if not next_token:
                 break
@@ -825,9 +1042,171 @@ class AmazonRepository:
                 next_token=next_token,
             )
 
-        return created_so_list
+        return processed_orders
 
 
+    def update_sales_order(self, so_name: str, amazon_order: dict):
+        """
+        Update existing Sales Order with latest Amazon data.
+        """
+        try:
+            so = frappe.get_doc("Sales Order", so_name)
+            order_id = amazon_order.get("AmazonOrderId")
+            current_status = amazon_order.get("OrderStatus")
+            
+            # Log status change
+            if so.custom_amazon_order_status != current_status:
+                frappe.log_error(
+                    f"Order {order_id} status changed: {so.custom_amazon_order_status} → {current_status}",
+                    "Amazon Order Status Update"
+                )
+                so.custom_amazon_order_status = current_status
+            
+            # Update order metadata
+            so.marketplace_id = amazon_order.get("MarketplaceId")
+            so.purchase_date = amazon_order.get("PurchaseDate")
+            so.latest_ship_date = amazon_order.get("LatestShipDate")
+            
+            # Fetch updated order items
+            updated_items = self.get_order_items(order_id)
+            
+            # Update items if changed
+            self.update_order_items(so, updated_items)
+            
+            # Update charges and fees
+            if self.amz_setting.taxes_charges:
+                charges_and_fees = self.get_charges_and_fees(order_id)
+                self.update_taxes_and_charges(so, charges_and_fees)
+            
+            so.save(ignore_permissions=True)
+            
+            # Only submit if not already submitted
+            if so.docstatus == 0:
+                so.submit()
+            
+            frappe.db.commit()
+            
+        except Exception as e:
+            frappe.log_error(
+                f"Failed to update Sales Order {so_name}: {str(e)}",
+                "Amazon Order Update Error"
+            )
+
+    def generate_reconciliation_report(self):
+        """
+        Generate report comparing Amazon vs ERPNext status.
+        """
+        report = {
+            "orders": [],
+            "mismatches": []
+        }
+        
+        # Get all Amazon orders from ERPNext
+        amazon_orders = frappe.get_all(
+            "Sales Order",
+            filters={"custom_amazon_order_id": ["is", "set"]},
+            fields=["name", "custom_amazon_order_id", "custom_amazon_order_status", "status"]
+        )
+        
+        for order in amazon_orders:
+            # Get current status from Amazon API
+            try:
+                orders_api = self.get_orders_instance()
+                amazon_data = self.call_sp_api_method(
+                    orders_api.get_order_items,
+                    order_id=order.custom_amazon_order_id
+                )
+                
+                current_amazon_status = "Unknown"
+                if amazon_data and amazon_data.get("OrderStatus"):
+                    current_amazon_status = amazon_data.get("OrderStatus")
+                
+                # Compare
+                if order.custom_amazon_order_status != current_amazon_status:
+                    report["mismatches"].append({
+                        "sales_order": order.name,
+                        "custom_amazon_order_id": order.custom_amazon_order_id,
+                        "erpnext_status": order.custom_amazon_order_status,
+                        "amazon_status": current_amazon_status
+                    })
+                
+                report["orders"].append({
+                    "sales_order": order.name,
+                    "custom_amazon_order_id": order.custom_amazon_order_id,
+                    "erpnext_status": order.custom_amazon_order_status,
+                    "amazon_status": current_amazon_status
+                })
+                
+            except Exception as e:
+                frappe.log_error(f"Error checking order {order.custom_amazon_order_id}: {str(e)}")
+        
+        return report
+    
+    def schedule_full_sync():
+        """
+        Daily full synchronization job.
+        """
+        amz_settings = frappe.get_all(
+            "Amazon SP API Settings",
+            filters={"is_active": 1, "enable_sync": 1},
+            fields=["name"]
+        )
+        
+        for setting in amz_settings:
+            try:
+                repo = AmazonRepository(setting.name)
+                
+                # Generate reconciliation report
+                report = repo.generate_reconciliation_report()
+                
+                # Fix mismatches
+                for mismatch in report.get("mismatches", []):
+                    frappe.enqueue(
+                        method=repo.sync_single_order,
+                        custom_amazon_order_id=mismatch["custom_amazon_order_id"],
+                        queue="long",
+                        timeout=600
+                    )
+                
+                # Regular sync for last 30 days
+                from_date = frappe.utils.add_days(frappe.utils.today(), -30)
+                repo.get_orders(from_date.strftime("%Y-%m-%d"))
+                
+            except Exception as e:
+                frappe.log_error(f"Full sync failed for {setting.name}: {str(e)}")
+
+
+    def update_order_items(self, sales_order, updated_items):
+        """
+        Update Sales Order items with latest Amazon data.
+        """
+        # Create a map of existing items by SKU
+        existing_items = {}
+        for item in sales_order.items:
+            existing_items[item.item_code] = item
+        
+        for updated_item in updated_items:
+            item_code = updated_item.get("item_code")
+            
+            if item_code in existing_items:
+                # Update existing item
+                existing_item = existing_items[item_code]
+                if existing_item.qty != updated_item.get("qty"):
+                    existing_item.qty = updated_item.get("qty")
+                if existing_item.rate != updated_item.get("rate"):
+                    existing_item.rate = updated_item.get("rate")
+            else:
+                # Add new item
+                sales_order.append("items", {
+                    "item_code": updated_item.get("item_code"),
+                    "item_name": updated_item.get("item_name"),
+                    "description": updated_item.get("description"),
+                    "qty": updated_item.get("qty"),
+                    "rate": updated_item.get("rate"),
+                    "warehouse": updated_item.get("warehouse"),
+                    "stock_uom": "Nos",
+                    "conversion_factor": 1,
+                })
 # -------------------------------------------------------------------------
 # CREDENTIAL VALIDATION
 # -------------------------------------------------------------------------

@@ -10,20 +10,22 @@ API_VERSION = "2024-01"
 
 WEBHOOK_EVENTS = [
     "orders/create",
+    "orders/updated",  # ← ADD THIS LINE
     "orders/paid",
     "orders/fulfilled",
     "orders/cancelled",
     "orders/partially_fulfilled",
-    "refunds/create",  # 👈 Add refund event
+    "refunds/create",
 ]
 
 EVENT_MAPPER = {
     "orders/create": "ecommerce_integrations.shopify.order.sync_sales_order",
+    "orders/updated": "ecommerce_integrations.shopify.invoice.prepare_sales_invoice",  # ← ADD THIS LINE
     "orders/paid": "ecommerce_integrations.shopify.invoice.prepare_sales_invoice",
     "orders/fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
     "orders/cancelled": "ecommerce_integrations.shopify.order.cancel_order",
     "orders/partially_fulfilled": "ecommerce_integrations.shopify.fulfillment.prepare_delivery_note",
-    "refunds/create": "ecommerce_integrations.shopify.refund.handle_refund",  # 👈 Map refund to handler
+    "refunds/create": "ecommerce_integrations.shopify.refund.handle_refund",
 }
 
 

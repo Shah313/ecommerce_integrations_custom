@@ -15,6 +15,25 @@ from ecommerce_integrations.shopify.constants import (
 
 
 def create_shopify_log(**kwargs):
+    """
+    Wrapper to create Shopify logs safely.
+    Ensures that request_data and response_data are decoded
+    before being handed over to EcommerceIntegrationLog.
+    """
+
+    # 🛡 Decode raw bytes from Shopify webhooks & API responses
+    if "request_data" in kwargs and isinstance(kwargs.get("request_data"), bytes):
+        try:
+            kwargs["request_data"] = kwargs["request_data"].decode("utf-8")
+        except Exception:
+            kwargs["request_data"] = kwargs["request_data"].decode("latin-1", errors="ignore")
+
+    if "response_data" in kwargs and isinstance(kwargs.get("response_data"), bytes):
+        try:
+            kwargs["response_data"] = kwargs["response_data"].decode("utf-8")
+        except Exception:
+            kwargs["response_data"] = kwargs["response_data"].decode("latin-1", errors="ignore")
+
     return create_log(module_def=MODULE_NAME, **kwargs)
 
 
@@ -79,9 +98,9 @@ def _get_items_to_migrate() -> list[_dict]:
 
     old_data = frappe.db.sql(
         """SELECT item.name as erpnext_item_code, shopify_product_id, shopify_variant_id, item.variant_of, item.has_variants
-			FROM tabItem item
-			LEFT JOIN `tabEcommerce Item` ei on ei.erpnext_item_code = item.name
-			WHERE ei.erpnext_item_code IS NULL AND shopify_product_id IS NOT NULL""",
+            FROM tabItem item
+            LEFT JOIN `tabEcommerce Item` ei on ei.erpnext_item_code = item.name
+            WHERE ei.erpnext_item_code IS NULL AND shopify_product_id IS NOT NULL""",
         as_dict=True,
     )
 

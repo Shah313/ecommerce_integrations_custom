@@ -127,11 +127,22 @@ def process_request(data, event):
 def _validate_request(req, hmac_header):
     settings = frappe.get_doc(SETTING_DOCTYPE)
     secret_key = settings.shared_secret
-
+    
+    # FIX 1: Check if hmac_header exists
+    if not hmac_header:
+        create_shopify_log(status="Error", request_data=req.data, exception="Missing HMAC header")
+        frappe.throw(_("Unverified Webhook Data"))
+    
+    # Calculate signature
     sig = base64.b64encode(
         hmac.new(secret_key.encode("utf8"), req.data, hashlib.sha256).digest()
     )
-
-    if sig != bytes(hmac_header.encode()):
-        create_shopify_log(status="Error", request_data=req.data)
+    
+    # FIX 2: Compare properly (hmac_header is already a string)
+    # Shopify sends HMAC as base64 string, we need to compare properly
+    calculated_sig = sig.decode('utf-8')  # Convert bytes to string
+    
+    # Use constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(calculated_sig, hmac_header):
+        create_shopify_log(status="Error", request_data=req.data, exception="HMAC verification failed")
         frappe.throw(_("Unverified Webhook Data"))

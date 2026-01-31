@@ -115,6 +115,11 @@ class AmazonSPAPISettings(Document):
 			get_orders,
 		)
 
+		from_date = frappe.utils.add_days(frappe.utils.today(), -30)
+		self.db_set("after_date", from_date)
+
+
+
 		if self.is_active == 1:
 			job_name = f"Get Amazon Orders - {self.name}"
 
