@@ -342,7 +342,7 @@ class AmazonRepository:
 
         existing = frappe.db.get_value(
             "Sales Order",
-            {"custom_amazon_order_id": order_id},
+            {"amazon_order_id": order_id},
             "name",
         )
         if existing:
@@ -388,7 +388,7 @@ class AmazonRepository:
 
         # ---------------- SALES ORDER HEADER ----------------
         so = frappe.new_doc("Sales Order")
-        so.custom_amazon_order_id = order_id
+        so.amazon_order_id = order_id
         so.marketplace_id = order.get("MarketplaceId")
         so.customer = customer
         so.company = self.amz_setting.company
@@ -528,7 +528,7 @@ class AmazonRepository:
             dn.customer = so.customer
             dn.currency = so.currency
             dn.custom_against_sales_order = so.name
-            dn.custom_amazon_order_id = so.custom_amazon_order_id
+            dn.custom_amazon_order_id = so.amazon_order_id
 
             for it in so.items:
                 dn.append(
@@ -582,7 +582,7 @@ class AmazonRepository:
             si.currency = so.currency  # Inherit from Sales Order
             si.conversion_rate = so.conversion_rate
             si.custom_against_sales_order = so.name
-            si.custom_amazon_order_id = so.custom_amazon_order_id
+            si.custom_amazon_order_id = so.amazon_order_id
             si.due_date = frappe.utils.add_days(frappe.utils.today(), 7)
 
             for it in so.items:
@@ -1016,7 +1016,7 @@ class AmazonRepository:
                 # Check if order already exists
                 existing_so = frappe.db.get_value(
                     "Sales Order",
-                    {"custom_amazon_order_id": order.get("AmazonOrderId")},
+                    {"amazon_order_id": order.get("AmazonOrderId")},
                     "name"
                 )
                 
@@ -1104,8 +1104,8 @@ class AmazonRepository:
         # Get all Amazon orders from ERPNext
         amazon_orders = frappe.get_all(
             "Sales Order",
-            filters={"custom_amazon_order_id": ["is", "set"]},
-            fields=["name", "custom_amazon_order_id", "custom_amazon_order_status", "status"]
+            filters={"amazon_order_id": ["is", "set"]},
+            fields=["name", "amazon_order_id", "amazon_order_status", "status"]
         )
         
         for order in amazon_orders:
@@ -1114,7 +1114,7 @@ class AmazonRepository:
                 orders_api = self.get_orders_instance()
                 amazon_data = self.call_sp_api_method(
                     orders_api.get_order_items,
-                    order_id=order.custom_amazon_order_id
+                    order_id=order.amazon_order_id
                 )
                 
                 current_amazon_status = "Unknown"
@@ -1125,14 +1125,14 @@ class AmazonRepository:
                 if order.custom_amazon_order_status != current_amazon_status:
                     report["mismatches"].append({
                         "sales_order": order.name,
-                        "custom_amazon_order_id": order.custom_amazon_order_id,
+                        "amazon_order_id": order.custom_amazon_order_id,
                         "erpnext_status": order.custom_amazon_order_status,
                         "amazon_status": current_amazon_status
                     })
                 
                 report["orders"].append({
                     "sales_order": order.name,
-                    "custom_amazon_order_id": order.custom_amazon_order_id,
+                    "amazon_order_id": order.custom_amazon_order_id,
                     "erpnext_status": order.custom_amazon_order_status,
                     "amazon_status": current_amazon_status
                 })
@@ -1142,38 +1142,38 @@ class AmazonRepository:
         
         return report
     
-    def schedule_full_sync():
-        """
-        Daily full synchronization job.
-        """
-        amz_settings = frappe.get_all(
-            "Amazon SP API Settings",
-            filters={"is_active": 1, "enable_sync": 1},
-            fields=["name"]
-        )
+    # def schedule_full_sync():
+    #     """
+    #     Daily full synchronization job.
+    #     """
+    #     amz_settings = frappe.get_all(
+    #         "Amazon SP API Settings",
+    #         filters={"is_active": 1, "enable_sync": 1},
+    #         fields=["name"]
+    #     )
         
-        for setting in amz_settings:
-            try:
-                repo = AmazonRepository(setting.name)
+    #     for setting in amz_settings:
+    #         try:
+    #             repo = AmazonRepository(setting.name)
                 
-                # Generate reconciliation report
-                report = repo.generate_reconciliation_report()
+    #             # Generate reconciliation report
+    #             report = repo.generate_reconciliation_report()
                 
-                # Fix mismatches
-                for mismatch in report.get("mismatches", []):
-                    frappe.enqueue(
-                        method=repo.sync_single_order,
-                        custom_amazon_order_id=mismatch["custom_amazon_order_id"],
-                        queue="long",
-                        timeout=600
-                    )
+    #             # Fix mismatches
+    #             for mismatch in report.get("mismatches", []):
+    #                 frappe.enqueue(
+    #                     method=repo.sync_single_order,
+    #                     custom_amazon_order_id=mismatch["custom_amazon_order_id"],
+    #                     queue="long",
+    #                     timeout=600
+    #                 )
                 
-                # Regular sync for last 30 days
-                from_date = frappe.utils.add_days(frappe.utils.today(), -30)
-                repo.get_orders(from_date.strftime("%Y-%m-%d"))
+    #             # Regular sync for last 30 days
+    #             from_date = frappe.utils.add_days(frappe.utils.today(), -30)
+    #             repo.get_orders(from_date.strftime("%Y-%m-%d"))
                 
-            except Exception as e:
-                frappe.log_error(f"Full sync failed for {setting.name}: {str(e)}")
+    #         except Exception as e:
+    #             frappe.log_error(f"Full sync failed for {setting.name}: {str(e)}")
 
 
     def update_order_items(self, sales_order, updated_items):
