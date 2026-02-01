@@ -503,7 +503,7 @@ class AmazonRepository:
         so.submit()
 
         # After SO creation, process DN / SI / Payment Entry based on status
-        self.process_order_documents_based_on_status(order, so.name)
+        # self.process_order_documents_based_on_status(order, so.name)
 
         return so.name
 
@@ -846,7 +846,7 @@ class AmazonRepository:
             # Update taxes/charges if enabled
             if self.amz_setting.taxes_charges:
                 charges_and_fees = self.get_charges_and_fees(order_id)
-                self.update_invoice_taxes(si, charges_and_fees)
+                # self.update_invoice_taxes(si, charges_and_fees)
             
             si.save(ignore_permissions=True)
             
@@ -876,11 +876,12 @@ class AmazonRepository:
             
             # For partial shipments, update quantities
             if status == "PartiallyShipped":
+                dn.save(ignore_permissions=True)
                 # Get updated order items
-                updated_items = self.get_order_items(order_id)
-                self.update_delivery_items(dn, updated_items)
+                # updated_items = self.get_order_items(order_id)
+                # self.update_delivery_items(dn, updated_items)
             
-            dn.save(ignore_permissions=True)
+            
             
             # Only submit if not already submitted
             if dn.docstatus == 0:
@@ -904,6 +905,55 @@ class AmazonRepository:
             f"Refund/Return check skipped for Amazon Order {order_id}",
             "Amazon Refund Placeholder"
         )
+
+
+    def handle_order_cancellation(self, order_id: str, so_name: str):
+        """
+        Handle Amazon Canceled order:
+        - Cancel SO if possible
+        - Cancel related Draft DN/SI if exists
+        - If submitted DN/SI exists, don't crash; just log
+        """
+        try:
+            so = frappe.get_doc("Sales Order", so_name)
+
+            # 1) Cancel Draft SI (docstatus=0) linked to this SO
+            draft_sis = frappe.get_all(
+                "Sales Invoice",
+                filters={"custom_against_sales_order": so_name, "docstatus": 0},
+                pluck="name"
+            )
+            for si_name in draft_sis:
+                si = frappe.get_doc("Sales Invoice", si_name)
+                si.cancel()
+
+            # 2) Cancel Draft DN (docstatus=0) linked to this SO
+            draft_dns = frappe.get_all(
+                "Delivery Note",
+                filters={"custom_against_sales_order": so_name, "docstatus": 0},
+                pluck="name"
+            )
+            for dn_name in draft_dns:
+                dn = frappe.get_doc("Delivery Note", dn_name)
+                dn.cancel()
+
+            # 3) Cancel Sales Order (only if allowed)
+            # If SO is submitted, cancel() may fail if linked docs exist
+            if so.docstatus == 1:
+                so.cancel()
+            elif so.docstatus == 0:
+                so.submit()
+                so.cancel()
+
+            frappe.db.commit()
+
+        except Exception as e:
+            # Don't crash sync job due to cancel restrictions
+            frappe.log_error(
+                f"Cancel handling failed for Amazon Order {order_id} / SO {so_name}: {str(e)[:200]}",
+                "Amazon Cancel Handling Error"
+            )
+
 
 
     
@@ -1028,6 +1078,11 @@ class AmazonRepository:
             next_token = payload.get("NextToken")
 
             for order in orders_list:
+
+                # ✅ SKIP CANCELLED ORDERS COMPLETELY (Amazon sends many)
+                if order.get("OrderStatus") == "Canceled":
+                    continue
+
                 # Check if order already exists
                 existing_so = frappe.db.get_value(
                     "Sales Order",
@@ -1047,6 +1102,7 @@ class AmazonRepository:
                     # PROCESS DOCUMENTS BASED ON CURRENT STATUS
                     self.process_order_documents_based_on_status(order, so_name)
                     processed_orders.append(so_name)
+
 
             if not next_token:
                 break
@@ -1080,7 +1136,7 @@ class AmazonRepository:
 
                 if self.amz_setting.taxes_charges:
                     charges_and_fees = self.get_charges_and_fees(order_id)
-                    self.update_taxes_and_charges(so, charges_and_fees)
+                    # self.update_taxes_and_charges(so, charges_and_fees)
 
                 so.save(ignore_permissions=True)
 
