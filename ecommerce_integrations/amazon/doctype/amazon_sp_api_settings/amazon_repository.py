@@ -382,7 +382,7 @@ class AmazonRepository:
             except Exception as e:
                 # If Country mapping fails, just log and continue
                 frappe.log_error(
-                    f"Address insert failed for Amazon Order {order_id}: {str(e)}",
+                    f"Address insert failed for Amazon Order {order_id}: {str(e)[:100]}",
                     "Amazon Address Error",
                 )
 
@@ -555,7 +555,7 @@ class AmazonRepository:
 
         except Exception as e:
             frappe.log_error(
-                f"DN Error for SO {sales_order_name}: {str(e)}",
+                f"DN Error for SO {sales_order_name}: {str(e)[:100]}",
                 "Amazon DN Error",
             )
             return None
@@ -619,7 +619,7 @@ class AmazonRepository:
 
         except Exception as e:
             frappe.log_error(
-                f"SI Error for SO {sales_order_name}: {str(e)}",
+                f"SI Error for SO {sales_order_name}: {str(e)[:100]}",
                 "Amazon SI Error",
             )
             return None
@@ -836,9 +836,12 @@ class AmazonRepository:
             order_id = amazon_order.get("AmazonOrderId")
             
             # Update due date if needed
-            new_due_date = frappe.utils.add_days(frappe.utils.today(), 7)
-            if si.due_date != new_due_date:
-                si.due_date = new_due_date
+            # ❗ Do NOT update due date after submission
+            if si.docstatus == 0:
+                new_due_date = frappe.utils.add_days(frappe.utils.today(), 7)
+                if si.due_date != new_due_date:
+                    si.due_date = new_due_date
+
             
             # Update taxes/charges if enabled
             if self.amz_setting.taxes_charges:
@@ -855,7 +858,7 @@ class AmazonRepository:
             
         except Exception as e:
             frappe.log_error(
-                f"Failed to update Sales Invoice {si_name}: {str(e)}",
+                f"Failed to update Sales Invoice {si_name}: {str(e)[:100]}",
                 "Amazon Invoice Update Error"
             )
 
@@ -887,7 +890,7 @@ class AmazonRepository:
             
         except Exception as e:
             frappe.log_error(
-                f"Failed to update Delivery Note {dn_name}: {str(e)}",
+                f"Failed to update Delivery Note {dn_name}: {str(e)[:100]}",
                 "Amazon DN Update Error"
             )
 
@@ -1058,51 +1061,43 @@ class AmazonRepository:
 
 
     def update_sales_order(self, so_name: str, amazon_order: dict):
-        """
-        Update existing Sales Order with latest Amazon data.
-        """
         try:
             so = frappe.get_doc("Sales Order", so_name)
             order_id = amazon_order.get("AmazonOrderId")
             current_status = amazon_order.get("OrderStatus")
-            
-            # Log status change
-            if so.custom_amazon_order_status != current_status:
-                frappe.log_error(
-                    f"Order {order_id} status changed: {so.custom_amazon_order_status} → {current_status}",
-                    "Amazon Order Status Update"
-                )
-                so.custom_amazon_order_status = current_status
-            
-            # Update order metadata
-            so.marketplace_id = amazon_order.get("MarketplaceId")
-            so.purchase_date = amazon_order.get("PurchaseDate")
-            so.latest_ship_date = amazon_order.get("LatestShipDate")
-            
-            # Fetch updated order items
-            updated_items = self.get_order_items(order_id)
-            
-            # Update items if changed
-            self.update_order_items(so, updated_items)
-            
-            # Update charges and fees
-            if self.amz_setting.taxes_charges:
-                charges_and_fees = self.get_charges_and_fees(order_id)
-                self.update_taxes_and_charges(so, charges_and_fees)
-            
-            so.save(ignore_permissions=True)
-            
-            # Only submit if not already submitted
+
+            # ❗ Do NOT update submitted Sales Order
             if so.docstatus == 0:
-                so.submit()
-            
+                if so.custom_amazon_order_status != current_status:
+                    so.custom_amazon_order_status = current_status
+
+                so.marketplace_id = amazon_order.get("MarketplaceId")
+                so.purchase_date = amazon_order.get("PurchaseDate")
+                so.latest_ship_date = amazon_order.get("LatestShipDate")
+
+                updated_items = self.get_order_items(order_id)
+                self.update_order_items(so, updated_items)
+
+                if self.amz_setting.taxes_charges:
+                    charges_and_fees = self.get_charges_and_fees(order_id)
+                    self.update_taxes_and_charges(so, charges_and_fees)
+
+                so.save(ignore_permissions=True)
+
+            else:
+                # Read-only tracking
+                frappe.logger().info(
+                    f"Amazon Order {order_id} status is {current_status} (SO submitted)"
+                )
+
             frappe.db.commit()
-            
+
         except Exception as e:
             frappe.log_error(
-                f"Failed to update Sales Order {so_name}: {str(e)}",
+                f"SO Update Failed {so_name}: {str(e)[:100]}",
                 "Amazon Order Update Error"
             )
+
 
     def generate_reconciliation_report(self):
         """
@@ -1150,7 +1145,7 @@ class AmazonRepository:
                 })
                 
             except Exception as e:
-                frappe.log_error(f"Error checking order {order.custom_amazon_order_id}: {str(e)}")
+                frappe.log_error(f"Error checking order {order.custom_amazon_order_id}: {str(e)[:100]}")
         
         return report
     
