@@ -72,10 +72,26 @@ class AmazonSPAPISettings(Document):
 			frappe.throw(_("Only one field can be selected to find the item code."))
 
 	def validate_after_date(self):
-		if datetime.strptime(add_days(today(), -30), "%Y-%m-%d") > datetime.strptime(
-			self.after_date, "%Y-%m-%d"
-		):
-			frappe.throw(_("The date must be within the last 30 days."))
+		"""Validate after_date is within Amazon's 90-day limit"""
+		max_days_back = 90  # Amazon SP API maximum for orders
+		
+		# Parse dates
+		max_allowed_date = datetime.strptime(add_days(today(), -max_days_back), "%Y-%m-%d")
+		selected_date = datetime.strptime(self.after_date, "%Y-%m-%d")
+		
+		if selected_date < max_allowed_date:
+			frappe.throw(
+				_("The date must be within the last {0} days (Amazon SP API limit).").format(max_days_back)
+			)
+		
+		# Optional: Warn if date is very old but still within 90 days
+		days_diff = (datetime.now() - selected_date).days
+		if days_diff > 60:
+			frappe.msgprint(
+				_("Note: Fetching data from {0} days ago. This may take longer.").format(days_diff),
+				indicator="orange",
+				alert=True
+			)
 
 	def validate_credentials(self):
 		from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_repository import (
@@ -115,10 +131,8 @@ class AmazonSPAPISettings(Document):
 			get_orders,
 		)
 
-		from_date = frappe.utils.add_days(frappe.utils.today(), -30)
-		self.db_set("after_date", from_date)
-
-
+		# Use the stored after_date instead of resetting to 30 days
+		from_date = self.after_date
 
 		if self.is_active == 1:
 			job_name = f"Get Amazon Orders - {self.name}"
@@ -130,12 +144,12 @@ class AmazonSPAPISettings(Document):
 				job_name=job_name,
 				method=get_orders,
 				amz_setting_name=self.name,
-				created_after=self.after_date,
+				created_after=from_date,
 				timeout=4000,
 				now=frappe.flags.in_test,
 			)
 
-			frappe.msgprint(_("Order details will be fetched in the background."))
+			frappe.msgprint(_("Order details will be fetched from {0}.").format(frappe.bold(from_date)))
 		else:
 			frappe.msgprint(_("Please enable the Amazon SP API Settings {0}.").format(frappe.bold(self.name)))
 

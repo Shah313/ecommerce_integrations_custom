@@ -326,25 +326,35 @@ class AmazonRepository:
         return final_items
 
     # -------------------------------------------------------------------------
-    # SALES ORDER CREATION
+    # SALES ORDER CREATION WITH DEADLOCK HANDLING
     # -------------------------------------------------------------------------
 
     def create_sales_order(self, order: dict) -> str | None:
         """
-        Create Sales Order from Amazon order:
-        - Customer + Address
-        - Items + Taxes (from Finances if available, else fallback)
-        - Auto run DN/SI/Payment logic based on status.
+        Create Sales Order from Amazon order with deadlock handling.
         """
         order_id = order.get("AmazonOrderId")
         if not order_id:
             return None
 
-        existing = frappe.db.get_value(
-            "Sales Order",
-            {"amazon_order_id": order_id},
-            "name",
-        )
+        # Check if order already exists (with deadlock retry)
+        existing = None
+        for attempt in range(3):  # Try 3 times for deadlock
+            try:
+                existing = frappe.db.get_value(
+                    "Sales Order",
+                    {"amazon_order_id": order_id},
+                    "name",
+                )
+                break
+            except frappe.QueryDeadlockError:
+                if attempt < 2:  # Not the last attempt
+                    time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    frappe.log_error(f"Deadlock checking order {order_id}", "Amazon Deadlock")
+                    return None
+
         if existing:
             return existing
 
@@ -356,15 +366,39 @@ class AmazonRepository:
         buyer = order.get("BuyerInfo") or {}
         buyer_email = buyer.get("BuyerEmail") or f"Buyer-{order_id}"
 
-        customer = frappe.db.get_value("Customer", buyer_email)
+        customer = None
+        for attempt in range(3):
+            try:
+                customer = frappe.db.get_value("Customer", buyer_email)
+                break
+            except frappe.QueryDeadlockError:
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                else:
+                    frappe.log_error(f"Deadlock checking customer {buyer_email}", "Amazon Deadlock")
+                    # Create customer anyway
+                    customer = None
+
         if not customer:
             c = frappe.new_doc("Customer")
             c.customer_name = buyer_email
             c.customer_group = self.amz_setting.customer_group
             c.territory = self.amz_setting.territory
             c.customer_type = self.amz_setting.customer_type
-            c.insert(ignore_permissions=True)
-            customer = c.name
+            
+            for attempt in range(3):
+                try:
+                    c.insert(ignore_permissions=True)
+                    customer = c.name
+                    break
+                except frappe.QueryDeadlockError:
+                    if attempt < 2:
+                        time.sleep(1 * (attempt + 1))
+                        continue
+                    else:
+                        frappe.log_error(f"Deadlock creating customer {buyer_email}", "Amazon Deadlock")
+                        return None
 
         # ---------------- ADDRESS ----------------
         shipping = order.get("ShippingAddress")
@@ -377,14 +411,21 @@ class AmazonRepository:
             addr.country = self.map_country_code(shipping.get("CountryCode"))
             addr.address_type = "Shipping"
             addr.append("links", {"link_doctype": "Customer", "link_name": customer})
-            try:
-                addr.insert(ignore_permissions=True)
-            except Exception as e:
-                # If Country mapping fails, just log and continue
-                frappe.log_error(
-                    f"Address insert failed for Amazon Order {order_id}: {str(e)[:100]}",
-                    "Amazon Address Error",
-                )
+            
+            for attempt in range(3):
+                try:
+                    addr.insert(ignore_permissions=True)
+                    break
+                except Exception as e:
+                    if attempt < 2 and "deadlock" in str(e).lower():
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    else:
+                        frappe.log_error(
+                            f"Address insert failed for Amazon Order {order_id}: {str(e)[:100]}",
+                            "Amazon Address Error",
+                        )
+                        break
 
         # ---------------- SALES ORDER HEADER ----------------
         so = frappe.new_doc("Sales Order")
@@ -392,14 +433,13 @@ class AmazonRepository:
         so.marketplace_id = order.get("MarketplaceId")
         so.customer = customer
         so.company = self.amz_setting.company
-                # Get company currency
+        # Get company currency
         company_currency = frappe.db.get_value("Company", so.company, "default_currency")
         so.currency = company_currency  # Explicitly set
 
         # Also set conversion rate if needed
         so.conversion_rate = 1.0
         so.plc_conversion_rate = 1.0
-
 
         purchase_date = order.get("PurchaseDate")
         latest_ship_date = order.get("LatestShipDate")
@@ -499,13 +539,37 @@ class AmazonRepository:
             "Amazon Order Breakdown",
         )
 
-        so.insert(ignore_permissions=True)
-        so.submit()
+        # Insert Sales Order with deadlock retry
+        so_name = None
+        for attempt in range(3):
+            try:
+                so.insert(ignore_permissions=True)
+                so_name = so.name
+                break
+            except frappe.QueryDeadlockError:
+                if attempt < 2:
+                    time.sleep(1 * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    frappe.log_error(f"Deadlock creating SO for order {order_id}", "Amazon Deadlock")
+                    return None
 
-        # After SO creation, process DN / SI / Payment Entry based on status
-        # self.process_order_documents_based_on_status(order, so.name)
+        if so_name:
+            # Submit Sales Order with deadlock retry
+            for attempt in range(3):
+                try:
+                    so.submit()
+                    break
+                except frappe.QueryDeadlockError:
+                    if attempt < 2:
+                        time.sleep(1 * (attempt + 1))
+                        continue
+                    else:
+                        frappe.log_error(f"Deadlock submitting SO {so_name}", "Amazon Deadlock")
+                        # Don't return None - SO was created, just not submitted
+                        break
 
-        return so.name
+        return so_name
 
     # -------------------------------------------------------------------------
     # DELIVERY NOTE
@@ -1039,12 +1103,13 @@ class AmazonRepository:
         
 
     # -------------------------------------------------------------------------
-    # MAIN GET ORDERS LOOP
+    # MAIN GET ORDERS LOOP WITH DEADLOCK HANDLING
     # -------------------------------------------------------------------------
 
     def get_orders(self, created_after: str) -> list:
         """
         Enhanced: Fetch orders from Amazon → create/update SOs → auto-create/update DN, SI, Payment Entry
+        WITH DEADLOCK HANDLING
         """
         orders_api = self.get_orders_instance()
 
@@ -1083,12 +1148,23 @@ class AmazonRepository:
                 if order.get("OrderStatus") == "Canceled":
                     continue
 
-                # Check if order already exists
-                existing_so = frappe.db.get_value(
-                    "Sales Order",
-                    {"amazon_order_id": order.get("AmazonOrderId")},
-                    "name"
-                )
+                # Check if order already exists with deadlock retry
+                existing_so = None
+                for attempt in range(3):
+                    try:
+                        existing_so = frappe.db.get_value(
+                            "Sales Order",
+                            {"amazon_order_id": order.get("AmazonOrderId")},
+                            "name"
+                        )
+                        break
+                    except frappe.QueryDeadlockError:
+                        if attempt < 2:
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                        else:
+                            frappe.log_error(f"Deadlock checking order {order.get('AmazonOrderId')}", "Amazon Deadlock")
+                            existing_so = None
                 
                 if existing_so:
                     # UPDATE EXISTING SALES ORDER
@@ -1100,8 +1176,12 @@ class AmazonRepository:
                 
                 if so_name:
                     # PROCESS DOCUMENTS BASED ON CURRENT STATUS
-                    self.process_order_documents_based_on_status(order, so_name)
-                    processed_orders.append(so_name)
+                    try:
+                        self.process_order_documents_based_on_status(order, so_name)
+                        processed_orders.append(so_name)
+                    except frappe.QueryDeadlockError:
+                        frappe.log_error(f"Deadlock processing documents for SO {so_name}", "Amazon Deadlock")
+                        # Continue with next order
 
 
             if not next_token:
