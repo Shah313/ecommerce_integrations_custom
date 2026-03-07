@@ -22,11 +22,13 @@
   "warehouse",
   "parent_item_group",
   "price_list",
+  "amazon_fee_account",
   "column_break_3",
   "customer_group",
   "territory",
   "customer_type",
   "market_place_account_group",
+  "amazon_refund_account",
   "amazon_fields_map_section",
   "amazon_fields_map",
   "create_item_if_not_exists",
@@ -254,10 +256,24 @@
    "fieldtype": "Password",
    "label": "AWS Secret Key",
    "reqd": 1
+  },
+  {
+   "fieldname": "amazon_refund_account",
+   "fieldtype": "Link",
+   "label": "Amazon Refund Account",
+   "options": "Account",
+   "reqd": 1
+  },
+  {
+   "fieldname": "amazon_fee_account",
+   "fieldtype": "Link",
+   "label": "Amazon Fee Account",
+   "options": "Account",
+   "reqd": 1
   }
  ],
  "links": [],
- "modified": "2025-11-20 04:13:06.996855",
+ "modified": "2026-02-15 04:54:31.460145",
  "modified_by": "Administrator",
  "module": "Amazon",
  "name": "Amazon SP API Settings",

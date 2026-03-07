@@ -20,23 +20,26 @@ class AmazonSPAPISettings(Document):
 		self.validate_amazon_fields_map()
 		self.validate_after_date()
 
-		if self.is_active == 1:
-			self.validate_credentials()
-			setup_custom_fields()
-		else:
-			self.enable_sync = 0
-
 		if not self.max_retry_limit:
 			self.max_retry_limit = 1
-		elif self.max_retry_limit and self.max_retry_limit > 5:
-			frappe.throw(frappe._("Value for <b>Max Retry Limit</b> must be less than or equal to 5."))
+		elif self.max_retry_limit > 5:
+			frappe.throw(_("Max Retry Limit must be ≤ 5"))
 
-	def save(self):
-		super().save()
 
+
+
+	def on_update(self):
+		# NOTE: never run heavy migration inside save/validate
 		if not self.is_old_data_migrated:
-			migrate_old_data()
-			self.db_set("is_old_data_migrated", 1)
+			frappe.enqueue(
+				"ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_sp_api_settings.migrate_old_data_job",
+				settings_name=self.name,
+				queue="long",
+				timeout=4000,
+			)
+
+
+	
 
 	def validate_amazon_fields_map(self):
 		count = 0
@@ -72,23 +75,28 @@ class AmazonSPAPISettings(Document):
 			frappe.throw(_("Only one field can be selected to find the item code."))
 
 	def validate_after_date(self):
-		"""Validate after_date is within Amazon's 90-day limit"""
-		max_days_back = 90  # Amazon SP API maximum for orders
+		"""Validate after_date is within Amazon's 6-month limit"""
 		
-		# Parse dates
-		max_allowed_date = datetime.strptime(add_days(today(), -max_days_back), "%Y-%m-%d")
+		max_days_back = 180  # 🔥 changed from 90 to 180
+		
+		max_allowed_date = datetime.strptime(
+			add_days(today(), -max_days_back), "%Y-%m-%d"
+		)
+		
 		selected_date = datetime.strptime(self.after_date, "%Y-%m-%d")
 		
 		if selected_date < max_allowed_date:
 			frappe.throw(
-				_("The date must be within the last {0} days (Amazon SP API limit).").format(max_days_back)
+				_("The date must be within the last {0} days (Amazon sync limit).")
+				.format(max_days_back)
 			)
 		
-		# Optional: Warn if date is very old but still within 90 days
 		days_diff = (datetime.now() - selected_date).days
-		if days_diff > 60:
+		
+		if days_diff > 120:
 			frappe.msgprint(
-				_("Note: Fetching data from {0} days ago. This may take longer.").format(days_diff),
+				_("Note: Fetching data from {0} days ago. Initial sync may take longer.")
+				.format(days_diff),
 				indicator="orange",
 				alert=True
 			)
@@ -108,6 +116,8 @@ class AmazonSPAPISettings(Document):
 			country=self.get("country"),
 		)
 
+
+
 	@frappe.whitelist()
 	def set_default_fields_map(self):
 		for field_map in [
@@ -124,6 +134,30 @@ class AmazonSPAPISettings(Document):
 			},
 		]:
 			self.append("amazon_fields_map", field_map)
+
+	@frappe.whitelist()
+	def process_settlement_reports(self):
+		"""Process Amazon settlement reports and create payment entries."""
+		from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_repository import (
+			process_settlements,
+		)
+
+		if self.is_active == 1:
+			job_name = f"Process Amazon Settlements - {self.name}"
+
+			frappe.enqueue(
+				job_name=job_name,
+				method=process_settlements,
+				amz_setting_name=self.name,
+				timeout=4000,
+			)
+
+			frappe.msgprint(_("Settlement processing started in background."))
+		else:
+			frappe.msgprint(_("Please enable the Amazon SP API Settings {0}.").format(frappe.bold(self.name)))
+	
+
+
 
 	@frappe.whitelist()
 	def get_order_details(self):
@@ -152,6 +186,18 @@ class AmazonSPAPISettings(Document):
 			frappe.msgprint(_("Order details will be fetched from {0}.").format(frappe.bold(from_date)))
 		else:
 			frappe.msgprint(_("Please enable the Amazon SP API Settings {0}.").format(frappe.bold(self.name)))
+
+	@frappe.whitelist()
+	def create_payments_from_invoices(self):
+			"""Create payment entries from unpaid invoices"""
+			from ecommerce_integrations.amazon.doctype.amazon_sp_api_settings.amazon_repository import create_amazon_payments_from_invoices
+			
+			return create_amazon_payments_from_invoices(
+				amz_setting_name=self.name,
+				months_back=3
+			)
+
+		
 
 
 # Called via a hook in every hour.
@@ -226,27 +272,58 @@ def setup_custom_fields():
                 insert_after="reference_no",
                 read_only=1,
                 print_hide=1,
-            )
-        ]
+            ),
+
+        ],
+		"Amazon SP API Settings": [
+			dict(
+				fieldname="amazon_payout_account",
+				label="Amazon Payout Account",
+				fieldtype="Link",
+				options="Account",
+				insert_after="enable_sync",
+				reqd=1,
+			)
+		]
+
     }
 
     create_custom_fields(custom_fields)
 
 
 def migrate_old_data():
-	column_exists = frappe.db.has_column("Item", "amazon_item_code")
+    if not frappe.db.has_column("Item", "amazon_item_code"):
+        return
 
-	if column_exists:
-		item = frappe.qb.DocType("Item")
-		items = (frappe.qb.from_(item).select("*").where(item.amazon_item_code.notnull())).run(as_dict=True)
+    item = frappe.qb.DocType("Item")
+    rows = (
+        frappe.qb.from_(item)
+        .select(item.name, item.amazon_item_code)
+        .where(item.amazon_item_code.notnull())
+    ).run(as_dict=True)
 
-		for item in items:
-			if not frappe.db.exists("Ecommerce Item", {"erpnext_item_code": item.name}):
-				ecomm_item = frappe.new_doc("Ecommerce Item")
-				ecomm_item.integration = "Amazon"
-				ecomm_item.erpnext_item_code = item.name
-				ecomm_item.integration_item_code = item.amazon_item_code
-				ecomm_item.has_variants = 0
-				ecomm_item.sku = item.amazon_item_code
-				ecomm_item.flags.ignore_mandatory = True
-				ecomm_item.save(ignore_permissions=True)
+    for r in rows:
+        if not frappe.db.exists("Ecommerce Item", {"erpnext_item_code": r["name"]}):
+            ecomm_item = frappe.new_doc("Ecommerce Item")
+            ecomm_item.integration = "Amazon"
+            ecomm_item.erpnext_item_code = r["name"]
+            ecomm_item.integration_item_code = r["amazon_item_code"]
+            ecomm_item.has_variants = 0
+            ecomm_item.sku = r["amazon_item_code"]
+            ecomm_item.flags.ignore_mandatory = True
+            ecomm_item.insert(ignore_permissions=True)
+
+
+
+def migrate_old_data_job(settings_name: str):
+    settings = frappe.get_doc("Amazon SP API Settings", settings_name)
+
+    # double-check (idempotent)
+    if settings.is_old_data_migrated:
+        return
+
+    migrate_old_data()
+
+    # mark done
+    settings.db_set("is_old_data_migrated", 1, update_modified=False)
+    frappe.db.commit()

@@ -214,6 +214,17 @@ extend_bootinfo = "ecommerce_integrations.boot.boot_session"
 
 before_tests = "ecommerce_integrations.utils.before_test.before_tests"
 
+
+# Scheduled Tasks
+scheduler_events = {
+    "hourly": [
+        "ecommerce_integrations.shopify.order.scheduled_pull_unfulfilled_orders"
+    ],
+    "daily": [
+        "ecommerce_integrations.shopify.order.scheduled_pull_all_paid_orders"
+    ]
+}
+
 # Overriding Methods
 # ------------------------------
 #

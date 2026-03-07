@@ -18,6 +18,11 @@ __all__ = [
     "CatalogItems",
 ]
 
+def amazon_datetime(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+
 
 # https://github.com/amzn/selling-partner-api-docs/blob/main/guides/en-US/developer-guide/SellingPartnerApiDeveloperGuide.md#selling-partner-api-endpoints
 MARKETPLACES = {
@@ -276,6 +281,8 @@ class SPAPI:
     def get_headers(self) -> dict:
         return {"x-amz-access-token": self.get_access_token()}
 
+    # In the SPAPI class, modify the make_request method:
+
     def make_request(
         self,
         method: str = "GET",
@@ -289,7 +296,20 @@ class SPAPI:
             data = Util.remove_empty(data)
 
         url = self.endpoint + self.BASE_URI + append_to_base_uri
-
+        
+        # DEBUG: Print everything
+        print(f"\n=== DEBUG make_request ===")
+        print(f"URL: {url}")
+        print(f"Method: {method}")
+        print(f"Params: {params}")
+        print(f"Params type: {type(params)}")
+        
+        # Check if params is actually a dict
+        if params:
+            print(f"Params keys: {list(params.keys())}")
+            for key, value in params.items():
+                print(f"  {key}: '{value}' (type: {type(value)})")
+        
         response = request(
             method=method,
             url=url,
@@ -298,45 +318,66 @@ class SPAPI:
             headers=self.get_headers(),
             auth=self.get_auth(),
         )
+        
+        print(f"Response status: {response.status_code}")
+        print(f"Response: {response.text[:200]}")
+        
         return response.json()
 
-    def list_to_dict(self, key: str, values: list, data: dict) -> None:
-        if values and isinstance(values, list):
-            for idx in range(len(values)):
-                data[f"{key}[{idx}]"] = values[idx]
 
-
+# -------------------------
+# ✅ PATCH 2: Finances.list_financial_event_groups (REPLACE THIS METHOD)
+# -------------------------
 class Finances(SPAPI):
     """Amazon Finances API"""
 
     BASE_URI = "/finances/v0/"
 
-    def list_financial_events_by_order_id(
-        self, order_id: str, max_results: int | None = None, next_token: str | None = None
-    ) -> dict:
-        """Returns all financial events for the specified order."""
-        append_to_base_uri = f"orders/{order_id}/financialEvents"
-        data = dict(MaxResultsPerPage=max_results, NextToken=next_token)
-        return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
-    
-    def list_financial_event_groups(self, posted_after=None, posted_before=None, max_results=None, next_token=None):
-        if not posted_after or not posted_before:
-            from datetime import datetime, timedelta
-            posted_after = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            posted_before = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            append_to_base_uri = "financialEventGroups"
+    def list_financial_event_groups(
+        self,
+        PostedAfter=None,
+        PostedBefore=None,
+        MaxResultsPerPage=100,
+        NextToken=None,
+    ):
+        from datetime import datetime, timedelta
+        import frappe
 
-            data = dict(
-                MaxResultsPerPage=max_results,
-                NextToken=next_token,
-                PostedAfter=posted_after,
-                PostedBefore=posted_before
-            )
+        append_to_base_uri = "financialEventGroups"
+        now = datetime.utcnow()
 
-            return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
-       
-        
-        
+        # Amazon max 90 days rule
+        if not PostedAfter:
+            PostedAfter = amazon_datetime(now - timedelta(days=89))
+
+        if not PostedBefore:
+            PostedBefore = amazon_datetime(now)
+
+        params = {
+            "PostedAfter": PostedAfter,
+            "PostedBefore": PostedBefore,
+            "MaxResultsPerPage": int(MaxResultsPerPage),
+        }
+
+        if NextToken:
+            params["NextToken"] = NextToken
+
+        frappe.log_error(
+            title="Amazon Finances FINAL PARAMS",
+            message=str(params),
+        )
+
+        return self.make_request(
+            append_to_base_uri=append_to_base_uri,
+            params=params,
+        )
+
+
+
+
+                
+                
+            
     
             
             
@@ -366,8 +407,6 @@ class Finances(SPAPI):
 
 
 class Orders(SPAPI):
-    """Amazon Orders API"""
-
     BASE_URI = "/orders/v0/orders"
 
     def get_orders(
@@ -383,14 +422,12 @@ class Orders(SPAPI):
         buyer_email: str | None = None,
         seller_order_id: str | None = None,
         max_results: int = 100,
-        easyship_shipment_statuses: list | None = None,
         next_token: str | None = None,
         amazon_order_ids: list | None = None,
         actual_fulfillment_supply_source_id: str | None = None,
-        is_ispu: bool = False,
         store_chain_store_id: str | None = None,
     ) -> dict:
-        """Returns orders created or updated during the time frame indicated by the specified parameters. You can also apply a range of filtering criteria to narrow the list of orders returned. If NextToken is present, that will be used to retrieve the orders instead of other criteria."""
+
         data = dict(
             CreatedAfter=created_after,
             CreatedBefore=created_before,
@@ -401,7 +438,6 @@ class Orders(SPAPI):
             MaxResultsPerPage=max_results,
             NextToken=next_token,
             ActualFulfillmentSupplySourceId=actual_fulfillment_supply_source_id,
-            IsISPU=is_ispu,
             StoreChainStoreId=store_chain_store_id,
         )
 
@@ -409,20 +445,26 @@ class Orders(SPAPI):
         self.list_to_dict("MarketplaceIds", marketplace_ids, data)
         self.list_to_dict("FulfillmentChannels", fulfillment_channels, data)
         self.list_to_dict("PaymentMethods", payment_methods, data)
-        self.list_to_dict("EasyShipShipmentStatuses", easyship_shipment_statuses, data)
         self.list_to_dict("AmazonOrderIds", amazon_order_ids, data)
 
         if not marketplace_ids:
-            marketplace_ids = [self.marketplace_id]
-            data["MarketplaceIds"] = marketplace_ids
+            data["MarketplaceIds"] = [self.marketplace_id]
 
         return self.make_request(params=data)
+
 
     def get_order_items(self, order_id: str, next_token: str | None = None) -> dict:
         """Returns detailed order item information for the order indicated by the specified order ID. If NextToken is provided, it's used to retrieve the next page of order items."""
         append_to_base_uri = f"/{order_id}/orderItems"
         data = dict(NextToken=next_token)
         return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
+    
+    def list_to_dict(self, key: str, values: list, data: dict) -> None:
+        """Convert list parameters to Amazon's expected format."""
+        if values and isinstance(values, list):
+            for idx in range(len(values)):
+                data[f"{key}[{idx}]"] = values[idx]
+
 
 
 class CatalogItems(SPAPI):
@@ -445,6 +487,8 @@ class CatalogItems(SPAPI):
         return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
 
 
+# -------------------------
+# -------------------------
 class Util:
     @staticmethod
     def get_marketplace(country_code):
@@ -461,15 +505,24 @@ class Util:
         region = marketplace.get("AWS Region")
         endpoint = marketplace.get("Endpoint")
         marketplace_id = marketplace.get(country_code)
-
         return region, endpoint, marketplace_id
 
     @staticmethod
-    def remove_empty(dict):
+    def remove_empty(d):
         """
-        Helper function that removes all keys from a dictionary (dict), that have an empty value.
+        ✅ SAFE remove_empty:
+        - removes ONLY None or "" (empty string)
+        - does NOT remove valid falsy values like 0, False
         """
-        for key in list(dict):
-            if not dict[key]:
-                del dict[key]
-        return dict
+        if not isinstance(d, dict):
+            return d
+
+        cleaned = {}
+        for k, v in d.items():
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip() == "":
+                continue
+            cleaned[k] = v
+        return cleaned
+
