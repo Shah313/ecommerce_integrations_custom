@@ -274,17 +274,8 @@ def setup_custom_fields():
                 print_hide=1,
             ),
 
-        ],
-		"Amazon SP API Settings": [
-			dict(
-				fieldname="amazon_payout_account",
-				label="Amazon Payout Account",
-				fieldtype="Link",
-				options="Account",
-				insert_after="enable_sync",
-				reqd=1,
-			)
-		]
+        ]
+		
 
     }
 

@@ -462,7 +462,7 @@ class AmazonRepository:
             company = self.amz_setting.company
 
         if not amazon_bank_account:
-            amazon_bank_account = self.amz_setting.amazon_payout_account
+            amazon_bank_account = self.amz_setting.custom_amazon_payout_accounts
 
         if not receivable_account:
             customer = self.get_amazon_customer()
@@ -1310,7 +1310,7 @@ class AmazonRepository:
         payout_acct = frappe.db.get_value(
             "Amazon SP API Settings", 
             self.amz_setting.name, 
-            "amazon_payout_account"
+            "custom_amazon_payout_accounts"
         )
         
         if not payout_acct:
