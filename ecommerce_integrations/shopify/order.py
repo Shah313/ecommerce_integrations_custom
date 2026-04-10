@@ -1,5 +1,5 @@
 import json
-from typing import Literal, Optional
+from typing import Literal
 
 import frappe
 from frappe import _
@@ -42,6 +42,7 @@ def sync_sales_order(payload, request_id=None):
             status="Invalid", message="Sales order already exists, not synced"
         )
         return
+
     try:
         shopify_customer = (
             order.get("customer") if order.get("customer") is not None else {}
@@ -49,6 +50,7 @@ def sync_sales_order(payload, request_id=None):
         shopify_customer["billing_address"] = order.get("billing_address", "")
         shopify_customer["shipping_address"] = order.get("shipping_address", "")
         customer_id = shopify_customer.get("id")
+
         if customer_id:
             customer = ShopifyCustomer(customer_id=customer_id)
             if not customer.is_synced():
@@ -60,6 +62,7 @@ def sync_sales_order(payload, request_id=None):
 
         setting = frappe.get_doc(SETTING_DOCTYPE)
         create_order(order, setting)
+
     except Exception as e:
         create_shopify_log(status="Error", exception=e, rollback=True)
     else:
@@ -69,50 +72,15 @@ def sync_sales_order(payload, request_id=None):
 def create_order(order, setting, company=None):
     from ecommerce_integrations.shopify.fulfillment import create_delivery_note
     from ecommerce_integrations.shopify.invoice import create_sales_invoice
-    from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 
     so = create_sales_order(order, setting, company)
     if not so:
         return
 
-    # -----------------------------
-    # STEP 1: Payment Entry on "Paid"
-    # -----------------------------
-    try:
-        if order.get("financial_status") == "paid":
-            existing_pe = frappe.db.exists(
-                "Payment Entry",
-                {
-                    "reference_no": order.get("id"),
-                    "reference_doctype": "Sales Order",
-                    "reference_name": so.name,
-                },
-            )
-            if not existing_pe:
-                pe = get_payment_entry("Sales Order", so.name)
-                pe.flags.ignore_mandatory = True
-                pe.reference_no = order.get("id")  # Shopify Order ID
-                pe.reference_date = getdate(order.get("created_at"))
-                pe.save(ignore_permissions=True)
-                pe.submit()
-                frappe.logger().info(
-                    f"[Shopify] Payment Entry {pe.name} created for Sales Order {so.name}"
-                )
-            else:
-                frappe.logger().info(
-                    f"[Shopify] Payment Entry already exists for Sales Order {so.name}"
-                )
-    except Exception as e:
-        frappe.logger().error(
-            f"[Shopify] Failed to create Payment Entry for Sales Order {so.name}: {e}"
-        )
-
-    # -----------------------------
-    # STEP 2: Delivery + Invoice on Fulfillment
-    # -----------------------------
     if order.get("fulfillments"):
         create_delivery_note(order, setting, so)
-        create_sales_invoice(order, setting, so)
+
+    create_sales_invoice(order, setting, so)
 
 
 def create_sales_order(shopify_order, setting, company=None):
@@ -129,22 +97,22 @@ def create_sales_order(shopify_order, setting, company=None):
 
     if not so:
         items = get_order_items(
-            shopify_order.get("line_items"),
+            shopify_order.get("line_items", []),
             setting,
             getdate(shopify_order.get("created_at")),
             taxes_inclusive=shopify_order.get("taxes_included"),
         )
 
         if not items:
-            message = (
-                "Following items exists in the shopify order but relevant records were"
-                " not found in the shopify Product master"
+            create_shopify_log(
+                status="Error",
+                exception=(
+                    "No valid line items found in Shopify order "
+                    f"{shopify_order.get('name')}. All items may have null "
+                    "product_id or product_exists=False."
+                ),
+                rollback=True,
             )
-            product_not_exists = []  # TODO: fix missing items
-            message += "\n" + ", ".join(product_not_exists)
-
-            create_shopify_log(status="Error", exception=message, rollback=True)
-
             return ""
 
         taxes = get_order_taxes(shopify_order, setting, items)
@@ -169,8 +137,9 @@ def create_sales_order(shopify_order, setting, company=None):
 
         if company:
             so.update({"company": company, "status": "Draft"})
+
         so.flags.ignore_mandatory = True
-        so.flags.shopiy_order_json = json.dumps(shopify_order)
+        so.flags.shopify_order_json = json.dumps(shopify_order)
         so.save(ignore_permissions=True)
         so.submit()
 
@@ -184,74 +153,94 @@ def create_sales_order(shopify_order, setting, company=None):
 
 
 def get_order_items(order_items, setting, delivery_date, taxes_inclusive):
+    """Build ERPNext item rows from Shopify line items.
+
+    Skips items where:
+    - product_id is None (bundle add-ons, protection plans, gift cards)
+    - product_exists is False (product deleted from Shopify)
+    - item_code cannot be resolved in ERPNext
+
+    These are logged but do not block order creation.
+    """
     items = []
-    all_product_exists = True
-    product_not_exists = []
 
     for shopify_item in order_items:
-        if not shopify_item.get("product_exists"):
-            all_product_exists = False
-            product_not_exists.append(
-                {
-                    "title": shopify_item.get("title"),
-                    ORDER_ID_FIELD: shopify_item.get("id"),
-                }
+        product_id = shopify_item.get("product_id")
+        title = shopify_item.get("title", "Unknown item")
+
+        # Skip null product_id items — protection plans, gift cards, bundles
+        if not product_id:
+            frappe.logger().info(
+                f"[Shopify] Order item skipped — null product_id: '{title}'"
             )
             continue
 
-        if all_product_exists:
-            item_code = get_item_code(shopify_item)
-            items.append(
-                {
-                    "item_code": item_code,
-                    "item_name": shopify_item.get("name"),
-                    "rate": _get_item_price(shopify_item, taxes_inclusive),
-                    "delivery_date": delivery_date,
-                    "qty": shopify_item.get("quantity"),
-                    "stock_uom": shopify_item.get("uom") or "Nos",
-                    "warehouse": setting.warehouse,
-                    ORDER_ITEM_DISCOUNT_FIELD: (
-                        _get_total_discount(shopify_item)
-                        / cint(shopify_item.get("quantity"))
-                    ),
-                    "custom_shopify_line_item_id": str(shopify_item.get("id")),
-                }
+        # Skip deleted/archived products
+        if not shopify_item.get("product_exists"):
+            frappe.logger().info(
+                f"[Shopify] Order item skipped — product_exists=False: '{title}'"
             )
-        else:
-            items = []
+            continue
+
+        item_code = get_item_code(shopify_item)
+        if not item_code:
+            frappe.logger().warning(
+                f"[Shopify] Could not resolve ERPNext item for '{title}' "
+                f"(product_id={product_id}). Skipping."
+            )
+            continue
+
+        qty = cint(shopify_item.get("quantity")) or 1
+        items.append(
+            {
+                "item_code": item_code,
+                "item_name": shopify_item.get("name"),
+                "rate": _get_item_price(shopify_item, taxes_inclusive),
+                "delivery_date": delivery_date,
+                "qty": qty,
+                "stock_uom": shopify_item.get("uom") or "Nos",
+                "warehouse": setting.warehouse,
+                ORDER_ITEM_DISCOUNT_FIELD: (
+                    _get_total_discount(shopify_item) / qty
+                ),
+                "custom_shopify_line_item_id": str(shopify_item.get("id")),
+            }
+        )
 
     return items
 
 
 def _get_item_price(line_item, taxes_inclusive: bool) -> float:
     price = flt(line_item.get("price"))
-    qty = cint(line_item.get("quantity"))
-
-    # remove line item level discounts
+    qty = cint(line_item.get("quantity")) or 1
     total_discount = _get_total_discount(line_item)
 
     if not taxes_inclusive:
         return price - (total_discount / qty)
 
-    total_taxes = 0.0
-    for tax in line_item.get("tax_lines"):
-        total_taxes += flt(tax.get("price"))
-
+    total_taxes = sum(flt(tax.get("price")) for tax in line_item.get("tax_lines", []))
     return price - (total_taxes + total_discount) / qty
 
 
 def _get_total_discount(line_item) -> float:
     discount_allocations = line_item.get("discount_allocations") or []
-    return sum(flt(discount.get("amount")) for discount in discount_allocations)
+    return sum(flt(d.get("amount")) for d in discount_allocations)
 
 
 def get_order_taxes(shopify_order, setting, items):
     taxes = []
-    line_items = shopify_order.get("line_items")
+    line_items = shopify_order.get("line_items", [])
 
     for line_item in line_items:
+        # Skip null product_id items — same guard as get_order_items
+        if not line_item.get("product_id"):
+            continue
+
         item_code = get_item_code(line_item)
-        for tax in line_item.get("tax_lines"):
+        if not item_code:
+            continue
+
+        for tax in line_item.get("tax_lines", []):
             taxes.append(
                 {
                     "charge_type": "Actual",
@@ -264,7 +253,10 @@ def get_order_taxes(shopify_order, setting, items):
                     "included_in_print_rate": 0,
                     "cost_center": setting.cost_center,
                     "item_wise_tax_detail": {
-                        item_code: [flt(tax.get("rate")) * 100, flt(tax.get("price"))]
+                        item_code: [
+                            flt(tax.get("rate")) * 100,
+                            flt(tax.get("price")),
+                        ]
                     },
                     "dont_recompute_tax": 1,
                 }
@@ -272,7 +264,7 @@ def get_order_taxes(shopify_order, setting, items):
 
     update_taxes_with_shipping_lines(
         taxes,
-        shopify_order.get("shipping_lines"),
+        shopify_order.get("shipping_lines", []),
         setting,
         items,
         taxes_inclusive=shopify_order.get("taxes_included"),
@@ -318,7 +310,7 @@ def consolidate_order_taxes(taxes):
 def get_tax_account_head(
     tax, charge_type: Literal["shipping", "sales_tax"] | None = None
 ):
-    tax_title = str(tax.get("title"))
+    tax_title = str(tax.get("title", ""))
 
     tax_account = frappe.db.get_value(
         "Shopify Tax Account",
@@ -333,39 +325,32 @@ def get_tax_account_head(
 
     if not tax_account:
         frappe.throw(
-            _("Tax Account not specified for Shopify Tax {0}").format(tax.get("title"))
+            _("Tax Account not specified for Shopify Tax {0}").format(tax_title)
         )
 
     return tax_account
 
 
 def get_tax_account_description(tax):
-    tax_title = tax.get("title")
-
-    tax_description = frappe.db.get_value(
+    return frappe.db.get_value(
         "Shopify Tax Account",
-        {"parent": SETTING_DOCTYPE, "shopify_tax": tax_title},
+        {"parent": SETTING_DOCTYPE, "shopify_tax": tax.get("title")},
         "tax_description",
     )
-
-    return tax_description
 
 
 def update_taxes_with_shipping_lines(
     taxes, shipping_lines, setting, items, taxes_inclusive=False
 ):
-    """Shipping lines represents the shipping details,
-    each such shipping detail consists of a list of tax_lines"""
     shipping_as_item = cint(setting.add_shipping_as_item) and setting.shipping_item
+
     for shipping_charge in shipping_lines:
         if shipping_charge.get("price"):
             shipping_discounts = shipping_charge.get("discount_allocations") or []
-            total_discount = sum(
-                flt(discount.get("amount")) for discount in shipping_discounts
-            )
+            total_discount = sum(flt(d.get("amount")) for d in shipping_discounts)
 
             shipping_taxes = shipping_charge.get("tax_lines") or []
-            total_tax = sum(flt(discount.get("price")) for discount in shipping_taxes)
+            total_tax = sum(flt(t.get("price")) for t in shipping_taxes)
 
             shipping_charge_amount = flt(shipping_charge["price"]) - flt(total_discount)
             if bool(taxes_inclusive):
@@ -392,13 +377,13 @@ def update_taxes_with_shipping_lines(
                             shipping_charge, charge_type="shipping"
                         ),
                         "description": get_tax_account_description(shipping_charge)
-                        or shipping_charge["title"],
+                        or shipping_charge.get("title", "Shipping"),
                         "tax_amount": shipping_charge_amount,
                         "cost_center": setting.cost_center,
                     }
                 )
 
-        for tax in shipping_charge.get("tax_lines"):
+        for tax in shipping_charge.get("tax_lines", []):
             taxes.append(
                 {
                     "charge_type": "Actual",
@@ -426,29 +411,21 @@ def update_taxes_with_shipping_lines(
 
 def get_sales_order(order_id):
     """Get ERPNext sales order using shopify order id."""
-    sales_order = frappe.db.get_value("Sales Order", filters={ORDER_ID_FIELD: order_id})
+    sales_order = frappe.db.get_value(
+        "Sales Order", filters={ORDER_ID_FIELD: cstr(order_id)}
+    )
     if sales_order:
         return frappe.get_doc("Sales Order", sales_order)
 
 
 def cancel_order(payload, request_id=None):
-    """Called by order/cancelled event.
-
-    When shopify order is cancelled there could be many different someone handles it.
-
-    Updates document with custom field showing order status.
-
-    IF sales invoice / delivery notes are not generated against an order, then cancel it.
-    """
     frappe.set_user("Administrator")
     frappe.flags.request_id = request_id
-
     order = payload
 
     try:
         order_id = order["id"]
         order_status = order["financial_status"]
-
         sales_order = get_sales_order(order_id)
 
         if not sales_order:
@@ -456,17 +433,16 @@ def cancel_order(payload, request_id=None):
             return
 
         sales_invoice = frappe.db.get_value(
-            "Sales Invoice", filters={ORDER_ID_FIELD: order_id}
+            "Sales Invoice", filters={ORDER_ID_FIELD: cstr(order_id)}
         )
         delivery_notes = frappe.db.get_list(
-            "Delivery Note", filters={ORDER_ID_FIELD: order_id}
+            "Delivery Note", filters={ORDER_ID_FIELD: cstr(order_id)}
         )
 
         if sales_invoice:
             frappe.db.set_value(
                 "Sales Invoice", sales_invoice, ORDER_STATUS_FIELD, order_status
             )
-
         for dn in delivery_notes:
             frappe.db.set_value(
                 "Delivery Note", dn.name, ORDER_STATUS_FIELD, order_status
@@ -496,6 +472,11 @@ def sync_old_orders():
     )
 
     for order in orders:
+        if frappe.db.get_value(
+            "Sales Order", {ORDER_ID_FIELD: cstr(order.get("id"))}
+        ):
+            continue
+
         log = create_shopify_log(
             method=EVENT_MAPPER["orders/create"],
             request_data=json.dumps(order),
@@ -509,16 +490,13 @@ def sync_old_orders():
 
 
 def _fetch_old_orders(from_time, to_time):
-    """Fetch all shopify orders in specified range and return an iterator on fetched orders."""
-
     from_time = get_datetime(from_time).astimezone().isoformat()
     to_time = get_datetime(to_time).astimezone().isoformat()
+
     orders_iterator = PaginatedIterator(
         Order.find(created_at_min=from_time, created_at_max=to_time, limit=250)
     )
 
     for orders in orders_iterator:
         for order in orders:
-            # Using generator instead of fetching all at once is better for
-            # avoiding rate limits and reducing resource usage.
             yield order.to_dict()

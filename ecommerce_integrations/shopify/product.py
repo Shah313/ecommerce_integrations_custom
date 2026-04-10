@@ -334,13 +334,33 @@ def _match_sku_and_link_item(
 
 
 def create_items_if_not_exist(order):
-    """Using shopify order, sync all items that are not already synced."""
+    """Using shopify order, sync all items that are not already synced.
+
+    Skips line items where product_id is None or product_exists is False.
+    These are protection plans, gift cards, bundle add-ons etc. that have
+    no Shopify product record — trying to fetch them causes a 400 error.
+    """
     for item in order.get("line_items", []):
-        product_id = item["product_id"]
+        product_id = item.get("product_id")
         variant_id = item.get("variant_id")
         sku = item.get("sku")
-        product = ShopifyProduct(product_id, variant_id=variant_id, sku=sku)
+        title = item.get("title", "Unknown")
 
+        # Guard 1: null product_id — non-inventory items
+        if not product_id:
+            frappe.logger().info(
+                f"[Shopify] Skipping '{title}' — product_id is null"
+            )
+            continue
+
+        # Guard 2: product deleted or archived in Shopify
+        if not item.get("product_exists"):
+            frappe.logger().info(
+                f"[Shopify] Skipping '{title}' — product_exists=False"
+            )
+            continue
+
+        product = ShopifyProduct(product_id, variant_id=variant_id, sku=sku)
         if not product.is_synced():
             product.sync_product()
 
