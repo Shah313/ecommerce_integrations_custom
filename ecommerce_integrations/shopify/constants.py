@@ -5,8 +5,9 @@ MODULE_NAME = "shopify"
 SETTING_DOCTYPE = "Shopify Setting"
 OLD_SETTINGS_DOCTYPE = "Shopify Settings"
 
-# Updated to latest stable Shopify API version
-API_VERSION = "2025-04"
+# NOTE: Keep at 2024-01 — the shopify Python library on Frappe Cloud
+# does not yet support 2025-04. Upgrade the library before changing this.
+API_VERSION = "2024-01"
 
 WEBHOOK_EVENTS = [
     "orders/create",
