@@ -19,7 +19,8 @@ from ecommerce_integrations.shopify.utils import create_shopify_log
 
 
 def temp_shopify_session(func):
-    """Any function that needs to access shopify api needs this decorator. The decorator starts a temp session that's destroyed when function returns."""
+    """Any function that needs to access shopify api needs this decorator.
+    The decorator starts a temp session that's destroyed when function returns."""
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -77,9 +78,10 @@ def unregister_webhooks(shopify_url: str, password: str) -> None:
 
 
 def get_current_domain_name() -> str:
-    """Get current site domain name. E.g. test.erpnext.com
+    """Get current site domain name.
 
-    If developer_mode is enabled and localtunnel_url is set in site config then domain  is set to localtunnel_url.
+    If developer_mode is enabled and localtunnel_url is set in site config
+    then domain is set to localtunnel_url.
     """
     if frappe.conf.developer_mode and frappe.conf.localtunnel_url:
         return frappe.conf.localtunnel_url
@@ -90,10 +92,10 @@ def get_current_domain_name() -> str:
 def get_callback_url() -> str:
     """Shopify calls this url when new events occur to subscribed webhooks.
 
-    If developer_mode is enabled and localtunnel_url is set in site config then callback url is set to localtunnel_url.
+    If developer_mode is enabled and localtunnel_url is set in site config
+    then callback url is set to localtunnel_url.
     """
     url = get_current_domain_name()
-
     return f"https://{url}/api/method/ecommerce_integrations.shopify.connection.store_request_data"
 
 
@@ -107,6 +109,14 @@ def store_request_data() -> None:
         data = json.loads(frappe.request.data)
         event = frappe.request.headers.get("X-Shopify-Topic")
 
+        if event not in EVENT_MAPPER:
+            # Unknown event – log and ignore gracefully
+            create_shopify_log(
+                status="Invalid",
+                message=f"Received unknown Shopify event: {event}",
+            )
+            return
+
         process_request(data, event)
 
 
@@ -114,7 +124,7 @@ def process_request(data, event):
     # create log
     log = create_shopify_log(method=EVENT_MAPPER[event], request_data=data)
 
-    # enqueue backround job
+    # enqueue background job
     frappe.enqueue(
         method=EVENT_MAPPER[event],
         queue="short",
@@ -125,24 +135,43 @@ def process_request(data, event):
 
 
 def _validate_request(req, hmac_header):
+    """Validate that the webhook came from Shopify using HMAC-SHA256.
+
+    Shopify signs the raw request body with the API Secret Key (shared_secret)
+    and sends the base64-encoded result in the X-Shopify-Hmac-Sha256 header.
+
+    IMPORTANT: Use the 'Shared secret' shown on the Shopify Webhooks page
+    (Settings > Notifications > Webhooks), NOT the API secret key from the
+    App credentials page — these are two different values.
+    """
     settings = frappe.get_doc(SETTING_DOCTYPE)
     secret_key = settings.shared_secret
-    
-    # FIX 1: Check if hmac_header exists
+
     if not hmac_header:
-        create_shopify_log(status="Error", request_data=req.data, exception="Missing HMAC header")
+        create_shopify_log(
+            status="Error",
+            request_data=req.data,
+            exception="Missing X-Shopify-Hmac-Sha256 header",
+        )
         frappe.throw(_("Unverified Webhook Data"))
-    
-    # Calculate signature
-    sig = base64.b64encode(
-        hmac.new(secret_key.encode("utf8"), req.data, hashlib.sha256).digest()
-    )
-    
-    # FIX 2: Compare properly (hmac_header is already a string)
-    # Shopify sends HMAC as base64 string, we need to compare properly
-    calculated_sig = sig.decode('utf-8')  # Convert bytes to string
-    
-    # Use constant-time comparison to prevent timing attacks
+
+    if not secret_key:
+        frappe.throw(_("Shared secret not configured in Shopify Setting"))
+
+    # Calculate expected HMAC
+    digest = hmac.new(
+        secret_key.encode("utf-8"),
+        req.data,          # raw bytes – do NOT decode before hashing
+        hashlib.sha256,
+    ).digest()
+
+    calculated_sig = base64.b64encode(digest).decode("utf-8")
+
+    # Constant-time comparison prevents timing attacks
     if not hmac.compare_digest(calculated_sig, hmac_header):
-        create_shopify_log(status="Error", request_data=req.data, exception="HMAC verification failed")
+        create_shopify_log(
+            status="Error",
+            request_data=req.data,
+            exception=f"HMAC mismatch. Got: {hmac_header[:10]}... Expected starts: {calculated_sig[:10]}...",
+        )
         frappe.throw(_("Unverified Webhook Data"))
